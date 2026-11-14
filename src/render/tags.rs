@@ -2084,7 +2084,10 @@ impl NamedCycle {
         if let Some(content) = &content {
             context.insert(self.asvar.clone(), content.to_py(py));
         } else {
-            context.insert(self.asvar.clone(), intern!(py, "").clone().into_any());
+            context.insert(
+                self.asvar.clone(),
+                PyString::new(py, string_if_invalid).into_any(),
+            );
         }
 
         Ok(ResolvedCycleValue { at, content })
@@ -2103,7 +2106,7 @@ impl Render for SimpleCycle {
         let ResolvedCycleValue { content, .. } =
             self.resolve_next(py, template, template_name, context, string_if_invalid)?;
         let Some(content) = content else {
-            return Ok(Cow::Borrowed(""));
+            return Ok(Cow::Borrowed(string_if_invalid));
         };
 
         Ok(content.render(py, template, context)?)
@@ -2122,7 +2125,7 @@ impl Render for NamedCycle {
         let ResolvedCycleValue { content, .. } =
             self.resolve_and_store(py, template, template_name, context, string_if_invalid)?;
         let Some(content) = content else {
-            return Ok(Cow::Borrowed(""));
+            return Ok(Cow::Borrowed(string_if_invalid));
         };
 
         Ok(content.render(py, template, context)?)
