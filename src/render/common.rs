@@ -11,7 +11,10 @@ use dtl_lexer::types::{PartsIterator, TemplateString};
 use super::types::{
     AsBorrowedContent, Content, ContentString, Context, IntoOwnedContent, PyContent,
 };
-use super::{Evaluate, FileName, Render, RenderResult, Resolve, ResolveFailures, ResolveResult};
+use super::{
+    Evaluate, FileName, Render, RenderResult, Resolve, ResolveContent, ResolveFailures,
+    ResolveResult, StringIfInvalid,
+};
 use crate::error::{
     AnnotatePyErr, ArgumentDoesNotExist, InnerVariableDoesNotExist, PyRenderError, RenderError,
 };
@@ -61,19 +64,19 @@ impl Resolve for Variable {
         template_name: &'t FileName,
         context: &mut Context,
         failures: ResolveFailures,
-        string_if_invalid: &'t str,
+        string_if_invalid: StringIfInvalid<'t>,
     ) -> ResolveResult<'t, 'py> {
         match self {
             Self::Variable(at) => {
                 let mut parts = PartsIterator::new(template, *at);
                 let (first, mut object_at) = parts.next().expect("Variable names cannot be empty");
                 let Some(variable) = context.get(first) else {
-                    return Ok(None);
+                    return Ok(ResolveContent::Missing(template.content(*at)));
                 };
                 let Some(mut variable) = resolve_callable(variable.bind(py).clone())
                     .map_err(|err| err.annotate(py, *at, "here", template))?
                 else {
-                    return Ok(None);
+                    return Ok(ResolveContent::Missing(template.content(*at)));
                 };
 
                 for (part, key_at) in parts {
@@ -99,7 +102,9 @@ impl Resolve for Variable {
                                             ))
                                             .into())
                                         }
-                                        ResolveFailures::IgnoreVariableDoesNotExist => Ok(None),
+                                        ResolveFailures::IgnoreVariableDoesNotExist => {
+                                            Ok(ResolveContent::Missing(template.content(*at)))
+                                        }
                                     };
                                 };
                                 match variable.get_item(int) {
@@ -113,11 +118,11 @@ impl Resolve for Variable {
                         .map_err(|err| err.annotate(py, *at, "here", template))?
                     {
                         Some(variable) => variable,
-                        None => return Ok(None),
+                        None => return Ok(ResolveContent::Missing(template.content(*at))),
                     };
                     object_at.1 += key_at.1 + 1;
                 }
-                Ok(Some(Content::Py(PyContent {
+                Ok(ResolveContent::Content(Content::Py(PyContent {
                     content: variable,
                     at: *at,
                 })))
@@ -138,10 +143,10 @@ impl Resolve for Variable {
                                 string_if_invalid,
                             );
                         }
-                        false => return Ok(Some("{}".as_content())),
+                        false => return Ok(ResolveContent::Content("{}".as_content())),
                     }
                 };
-                Ok(Some(match for_variable.variant {
+                Ok(ResolveContent::Content(match for_variable.variant {
                     ForVariableName::Counter => Content::Int(for_loop.counter().into()),
                     ForVariableName::Counter0 => Content::Int(for_loop.counter0().into()),
                     ForVariableName::RevCounter => Content::Int(for_loop.rev_counter().into()),
@@ -178,7 +183,7 @@ impl Resolve for Variable {
                     },
                 };
                 context.block = Some((block, template));
-                Ok(Some(rendered?))
+                Ok(ResolveContent::Content(rendered?))
             }
         }
     }
@@ -192,13 +197,15 @@ impl Resolve for Text {
         _template_name: &'t FileName,
         context: &mut Context,
         _failures: ResolveFailures,
-        _string_if_invalid: &'t str,
+        _string_if_invalid: StringIfInvalid<'t>,
     ) -> ResolveResult<'t, 'py> {
         let resolved = Cow::Borrowed(template.content(self.at));
-        Ok(Some(Content::String(match context.autoescape {
-            false => ContentString::String(resolved),
-            true => ContentString::HtmlSafe(resolved),
-        })))
+        Ok(ResolveContent::Content(Content::String(
+            match context.autoescape {
+                false => ContentString::String(resolved),
+                true => ContentString::HtmlSafe(resolved),
+            },
+        )))
     }
 }
 
@@ -210,14 +217,16 @@ impl Resolve for TranslatedText {
         _template_name: &'t FileName,
         context: &mut Context,
         _failures: ResolveFailures,
-        _string_if_invalid: &'t str,
+        _string_if_invalid: StringIfInvalid<'t>,
     ) -> ResolveResult<'t, 'py> {
         let text = template.content(self.at);
         let resolved = gettext(py, text)?;
-        Ok(Some(Content::String(match context.autoescape {
-            false => ContentString::String(Cow::Owned(resolved)),
-            true => ContentString::HtmlSafe(Cow::Owned(resolved)),
-        })))
+        Ok(ResolveContent::Content(Content::String(
+            match context.autoescape {
+                false => ContentString::String(Cow::Owned(resolved)),
+                true => ContentString::HtmlSafe(Cow::Owned(resolved)),
+            },
+        )))
     }
 }
 
@@ -229,9 +238,9 @@ impl Resolve for Argument {
         template_name: &'t FileName,
         context: &mut Context,
         failures: ResolveFailures,
-        string_if_invalid: &'t str,
+        string_if_invalid: StringIfInvalid<'t>,
     ) -> ResolveResult<'t, 'py> {
-        Ok(Some(match &self.argument_type {
+        Ok(ResolveContent::Content(match &self.argument_type {
             ArgumentType::Text(text) => {
                 return text.resolve(
                     py,
@@ -261,8 +270,8 @@ impl Resolve for Argument {
                     failures,
                     string_if_invalid,
                 )? {
-                    Some(content) => content,
-                    None => {
+                    ResolveContent::Content(content) => content,
+                    ResolveContent::Missing(_) => {
                         let at = match variable {
                             Variable::Variable(at) => *at,
                             Variable::BlockSuper(_) => {
@@ -302,7 +311,7 @@ impl Resolve for TagElement {
         template_name: &'t FileName,
         context: &mut Context,
         failures: ResolveFailures,
-        string_if_invalid: &'t str,
+        string_if_invalid: StringIfInvalid<'t>,
     ) -> ResolveResult<'t, 'py> {
         match self {
             Self::Text(text) | Self::TranslatedText(text) => text.resolve(
@@ -329,8 +338,8 @@ impl Resolve for TagElement {
                 failures,
                 string_if_invalid,
             ),
-            Self::Int(int) => Ok(Some(Content::Int(int.clone()))),
-            Self::Float(float) => Ok(Some(Content::Float(*float))),
+            Self::Int(int) => Ok(ResolveContent::Content(Content::Int(int.clone()))),
+            Self::Float(float) => Ok(ResolveContent::Content(Content::Float(*float))),
         }
     }
 }
@@ -342,7 +351,7 @@ impl Evaluate for TagElement {
         template: TemplateString<'_>,
         template_name: &FileName,
         context: &mut Context,
-        string_if_invalid: &str,
+        string_if_invalid: StringIfInvalid<'_>,
     ) -> Option<bool> {
         self.resolve(
             py,
@@ -353,6 +362,7 @@ impl Evaluate for TagElement {
             string_if_invalid,
         )
         .ok()?
+        .maybe_content()
         .evaluate(py, template, template_name, context, string_if_invalid)
     }
 }
@@ -364,7 +374,7 @@ impl Render for TokenTree {
         template: TemplateString<'t>,
         template_name: &'t FileName,
         context: &mut Context,
-        string_if_invalid: &'t str,
+        string_if_invalid: StringIfInvalid<'t>,
     ) -> RenderResult<'t> {
         match self {
             Self::Text(text) => {
@@ -404,7 +414,7 @@ mod tests {
             let variable = Variable::Variable((3, 4));
 
             let rendered = variable
-                .render(py, template, &FileName(None), &mut context, "")
+                .render(py, template, &FileName(None), &mut context, "".into())
                 .unwrap();
             assert_eq!(rendered, "Lily");
         });
@@ -424,7 +434,7 @@ mod tests {
             let variable = Variable::Variable((3, 9));
 
             let rendered = variable
-                .render(py, template, &FileName(None), &mut context, "")
+                .render(py, template, &FileName(None), &mut context, "".into())
                 .unwrap();
             assert_eq!(rendered, "Lily");
         });
@@ -443,7 +453,7 @@ mod tests {
             let variable = Variable::Variable((3, 7));
 
             let rendered = variable
-                .render(py, template, &FileName(None), &mut context, "")
+                .render(py, template, &FileName(None), &mut context, "".into())
                 .unwrap();
             assert_eq!(rendered, "Lily");
         });
@@ -474,7 +484,7 @@ user = User('Lily')
             let variable = Variable::Variable((3, 9));
 
             let rendered = variable
-                .render(py, template, &FileName(None), &mut context, "")
+                .render(py, template, &FileName(None), &mut context, "".into())
                 .unwrap();
             assert_eq!(rendered, "Lily");
         });
@@ -492,7 +502,7 @@ user = User('Lily')
             let html = Variable::Variable((3, 4));
 
             let rendered = html
-                .render(py, template, &FileName(None), &mut context, "")
+                .render(py, template, &FileName(None), &mut context, "".into())
                 .unwrap();
             assert_eq!(rendered, "&lt;p&gt;Hello World!&lt;/p&gt;");
         });
